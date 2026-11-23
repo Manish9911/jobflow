@@ -127,9 +127,14 @@ def _same_brand(a: str, b: str) -> bool:
 # OPTIONAL prefix and no word boundary, so it matched "fee" INSIDE words —
 # "feedback"/"feedback"/"coffee" in ordinary JDs ("the feedback loop is
 # short") hard-rejected 7 real Algolia postings. Now a fee claim requires
-# an explicit fee-context word ("application fee", "pay a fee", …) or an
+# explicit fee-context word ("application fee", "pay a fee", …) or an
 # explicit payment verb, and "no application fee" (a reassurance, common in
 # real postings) must NOT match — hence the (?<!no\s) guard.
+# NOTE (live false positive, 2026-11-23): a BARE "bitcoin" alternative
+# hard-rejected legitimate Coinbase postings whose JDs describe building
+# Bitcoin infrastructure (the employer IS a crypto company). A crypto
+# PAYMENT demand is still caught by the crypto(currency)?
+# (payment|transfer|wallet) branch below.
 _FEE_PATTERNS = re.compile(
     r"""
     (?<!no\s)(?:registration|application|processing|training|onboarding|enrollment)\s+fees?
@@ -139,7 +144,6 @@ _FEE_PATTERNS = re.compile(
     |wire\s+transfer
     |money\s+order
     |crypto(?:currency)?\s+(?:payment|transfer|wallet)
-    |bitcoin
     |upfront\s+payment
     |advance\s+payment
     """,
@@ -231,6 +235,64 @@ def _domain(url: str | None) -> str:
     return host
 
 
+_NEGLATION_WINDOW = re.compile(
+    r"\b(never|will\s+not|won'?t|don'?t|do\s+not|cannot|can'?t|"
+    r"not\s+(?:ask|request|require|charge))\b", re.I)
+
+
+def _find_hard_signal(pattern: re.Pattern[str], text: str):
+    """First match NOT preceded (within 60 chars) by a negation word.
+
+    Live false positive 2026-11-23: Optum's JD says "UnitedHealth Group will
+    never request you to pay a vendor or pay a fee of any sort" — a
+    REASSURANCE that the old bare .search() read as a fee demand and
+    hard-rejected a real full-stack Java role.
+    """
+    for m in pattern.finditer(text):
+        pre = text[max(0, m.start() - 60):m.start()]
+        if _NEGLATION_WINDOW.search(pre):
+            continue
+        return m
+    return None
+
+
+# Context guard for fee signals (live false positive, 2026-11-23): a scraped
+# page includes the employer's site chrome — Coinbase's footer reads
+# "How to set up a crypto wallet? How to send crypto?" and its header promo
+# says "Earn up to 4% Bitcoin back on every purchase". Marketing about the
+# employer's PRODUCTS is not a payment demand on the candidate. A fee match
+# is a hard signal only when the surrounding window (±60 chars) shows the
+# demand is directed at the candidate: a role marker AND a demand marker.
+_FEE_ROLE_RE = re.compile(r"\b(you|your|candidate|candidates|applicant|applicants)\b", re.I)
+_FEE_DEMAND_RE = re.compile(
+    r"\b(must|required|mandatory|compulsory|pay|paid|payment|send|wire|"
+    r"transfer|submit|deposit|remittance|condition)\b|to\s+apply", re.I)
+# Match text that IS itself a fee/payment demand — no context needed.
+_FEE_SELF_EVIDENT_RE = re.compile(
+    r"fee|^\s*pay\b|wire\s+transfer|money\s+order|crypto(?:currency)?\s+(?:payment|transfer)",
+    re.I)
+
+
+def _find_fee_demand(pattern: re.Pattern[str], text: str):
+    """First fee-pattern match that is a real demand on the candidate.
+
+    Negation guard (see _find_hard_signal) + candidate-directed context:
+    self-evident matches (contain 'fee', or are a payment verb / wire /
+    money order / crypto payment|transfer) count alone; anything else needs
+    BOTH a role marker and a demand marker within ±60 chars.
+    """
+    for m in pattern.finditer(text):
+        pre = text[max(0, m.start() - 60):m.start()]
+        if _NEGLATION_WINDOW.search(pre):
+            continue
+        if _FEE_SELF_EVIDENT_RE.search(m.group(0)):
+            return m
+        window = text[max(0, m.start() - 60):min(len(text), m.end() + 60)]
+        if _FEE_ROLE_RE.search(window) and _FEE_DEMAND_RE.search(window):
+            return m
+    return None
+
+
 def assess_job_fraud(
     jd_text: str,
     apply_url: str | None,
@@ -245,12 +307,12 @@ def assess_job_fraud(
     reject_reasons: list[str] = []
     review_reasons: list[str] = []
 
-    m = _FEE_PATTERNS.search(text)
+    m = _find_fee_demand(_FEE_PATTERNS, text)
     if m:
         reject_reasons.append(
             f"posting asks the candidate to pay ({m.group(0).strip()!r}) — "
             "legitimate employers never charge to apply")
-    m = _ID_DOC_PATTERNS.search(text)
+    m = _find_hard_signal(_ID_DOC_PATTERNS, text)
     if m:
         reject_reasons.append(
             f"posting demands identity/financial documents ({m.group(0).strip()!r})")

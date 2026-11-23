@@ -229,3 +229,24 @@ def test_clean_form_text_not_flagged():
 
 def test_empty_inputs():
     assert assess_job_fraud("", None, None)["decision"] == "apply"
+
+
+def test_crypto_company_jd_mentioning_bitcoin_not_a_fee():
+    # Coinbase (live 2026-11-23): JDs describe BUILDING Bitcoin
+    # infrastructure — the bare word is a product topic, not a payment
+    # demand on the candidate.
+    jd = ("Machine Learning Engineer. You will build ML systems that power "
+          "our Bitcoin and digital-asset infrastructure. Work with Kafka, "
+          "Spark, and large-scale data pipelines serving millions of users.")
+    r = assess_job_fraud(jd, "https://jobs.ashbyhq.com/coinbase/x", "https://www.coinbase.com")
+    assert r["decision"] != "reject", r["reasons"]
+
+
+def test_crypto_payment_demand_still_flags():
+    # A real payment demand phrased with crypto wording is still a hard
+    # signal (the crypto(payment|transfer|wallet) branch).
+    r = assess_job_fraud(
+        "Selected candidates must make a crypto transfer of $200 to cover "
+        "background check costs.",
+        "https://example.com/apply", None)
+    assert r["decision"] == "reject"
