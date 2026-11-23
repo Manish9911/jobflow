@@ -26,6 +26,7 @@ ATS from rate-limiting or banning the browser.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from datetime import datetime
@@ -35,6 +36,7 @@ from ..db.models import Application, Job
 AGENT_INTERVAL_S = 15          # pause between jobs (each run itself takes 30-90s)
 IDLE_POLL_S = 20               # re-check for new jobs when the queue is empty
 MAX_ATTEMPTS = 2               # retry a failed run at most this many times
+MAX_APPS_PER_COMPANY = 2       # max SUBMITTED applications per company
 MAX_EVENTS = 60
 INGEST_ROTATE_MIN_GAP_S = 30 * 60  # rotate sources (pull fresh jobs) at most every 30 min
 
@@ -50,6 +52,27 @@ _HANDLED_STATUSES = {
     # not re-battled, until the user clears the wall.
     "skipped_walled",
 }
+
+
+def _company_key(job: Job) -> str:
+    """Normalized company identity for the per-company application cap
+    (rejection lesson 2026-11-23: Affirm received 10 bulk applications and
+    the whole company view tanked). Prefers the website domain; falls back
+    to the first name token with legal suffixes stripped."""
+    site = (getattr(job, "company_website", None) or "").lower().strip()
+    if site:
+        dom = site.replace("http://", "").replace("https://", "").split("/")[0]
+        dom = re.sub(r"^www\.", "", dom)
+        if dom:
+            return dom
+    company = (getattr(job, "company", None) or "").lower().strip()
+    for variant in (" inc.", " inc", " llc", " ltd.", " ltd", " corp.", " corp",
+                    " corporation", " group", " companies", " plc", " gmbh",
+                    " srl", " pty", " sa"):
+        if company.endswith(variant):
+            company = company[: -len(variant)]
+    company = re.sub(r"[^a-z0-9 ]+", " ", company).strip()
+    return company.split(" ")[0] if company else ""
 
 
 class AutoApplyAgent:
@@ -193,7 +216,29 @@ class AutoApplyAgent:
         # Order: highest match first (None last), newest first as tiebreak.
         jobs.sort(key=lambda j: (-(j.match_score if j.match_score is not None else -1),
                                  -j.id))
+        # Company cap (rejection lesson 2026-11-23): bulk applications to one
+        # company read as spam — Affirm took 10 of ours, then rejected. Skip
+        # jobs whose company already has MAX_APPS_PER_COMPANY submissions.
+        comp_jobs: dict[str, list[int]] = {}
+        for j in jobs:
+            k = _company_key(j)
+            if k:
+                comp_jobs.setdefault(k, []).append(j.id)
+        over_cap: set[int] = set()
+        for k, ids in comp_jobs.items():
+            if len(ids) < MAX_APPS_PER_COMPANY + 1:
+                continue
+            submitted = (
+                db.query(Application.job_id)
+                .filter(Application.job_id.in_(ids),
+                        Application.status == "submitted")
+                .all()
+            )
+            if len(submitted) >= MAX_APPS_PER_COMPANY:
+                over_cap.update(ids)
         for job in jobs:
+            if job.id in over_cap:
+                continue
             if self.min_score > 0 and (
                 job.match_score is None or job.match_score < self.min_score
             ):
@@ -287,6 +332,16 @@ class AutoApplyAgent:
 
         assessment = assess_jd(jd_text)
 
+        # Title-level gate (rejection lessons 2026-11-23): Principal/Staff/
+        # Manager/Director titles are above the 4+ year resume level, and
+        # native iOS/Android roles are a discipline mismatch — both rejected
+        # in the field (Elastic, Garmin, Affirm) even with clean JDs.
+        from ..services.eligibility import assess_title
+        title_assess = assess_title(getattr(job, "title", None) or title)
+        if title_assess["decision"] == "reject":
+            assessment["reasons"].extend(title_assess["reasons"])
+            assessment["decision"] = "reject"
+
         from ..db.models import Profile
         from ..automation.runner import _resume_for_job
         try:
@@ -296,18 +351,18 @@ class AutoApplyAgent:
             resume_id = None
 
         # Cheap parameter pre-screen, continued: judge the JD's actual stack,
-        # not just the title (user rule 2026-11-05 — companies name roles
-        # differently). Deterministic + token-free: reject only when the JD is
-        # built around 3+ canonical skills the resume has NONE of.
+        # not just the title (user rule 2026-11-05). Deterministic + token-free.
+        # USER RULE 2026-11-18: stack mismatch NEVER rejects — apply anyway and
+        # record which JD skills to ADD to the tailored resume (`jd_skills_missing`).
         if assessment["decision"] == "apply":
             from ..ingestion.service import load_resume_skills
             from ..services.eligibility import assess_jd_skills
             stack = assess_jd_skills(jd_text, load_resume_skills(db))
-            if stack["decision"] == "reject":
-                assessment["decision"] = "reject"
+            if stack.get("missing"):
+                assessment["jd_skills_missing"] = stack["missing"]
                 assessment["reasons"].extend(stack["reasons"])
-                assessment["note"] = ("JD stack mismatch — application refused "
-                                      "before filling anything")
+                assessment["note"] = ("JD skills to add to resume: "
+                                      + ", ".join(stack["missing"]))
 
         job.jd_eligibility_json = json.dumps(assessment)
 
