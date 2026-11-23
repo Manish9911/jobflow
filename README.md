@@ -121,6 +121,32 @@ Open http://127.0.0.1:8000/ — the dashboard.
 uv run python scripts/seed_profile.py path/to/resume.docx
 ```
 
+## Run on any machine (full pipeline)
+
+Everything the pipeline needs is in this repo — app code plus every `data/*.py` script (resume builder, ATS drivers, drill apply/record, quota watchdog, graphify wrapper). The gitignored runtime state is intentionally local-only and must exist on each machine:
+
+1. `uv venv && uv sync`
+2. `cp .env.example .env` — set `OPENROUTER_API_KEY` (free-tier key) + `LLM_MODEL` / `LLM_MODELS` (dual free-model pool).
+3. Master resume DOCX on the machine; the builder scripts (`data/build_content.py`, `data/build_resume.py`) hold its default path constant — adjust if it lives elsewhere.
+4. `data/jobflow.db` is NOT committed — a fresh clone starts with an empty DB. Credential files (`data/portal_credentials.json`, `data/credentials_workday.txt`, `data/gmail_app_password.txt`) are local-only by design and are never committed.
+5. ATS automation drives a REAL visible Chrome over CDP port 9334 (`chrome.exe --remote-debugging-port=9334 --profile-directory=Default`) — the real profile is what passes reCAPTCHA walls; never headless for submissions.
+6. Optional — Graphify knowledge graph: clone `github.com/Graphify-Labs/graphify` into `third_party/graphify`, then `uv tool install --force "graphifyy[openai,mcp,leiden,pdf,office,watch,sql] @ file:///<repo>/third_party/graphify"` and build with `data/run_graphify.py` (free OpenRouter backend). Outputs in `graphify-out/` (gitignored); query with `graphify query "<question>"`.
+7. Optional — Gmail verification codes: himalaya CLI + app password file (never committed).
+
+Core commands:
+
+```bash
+# app (start from the REPO ROOT — DB path is CWD-relative)
+uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+
+# per-job pipeline
+#   JD fetch + pre-screen (eligibility.py) → data/build_content.py --keywords "..."
+#   → data/build_resume.py --content ... --out dir → data/ats_apply.py --url ... --resume ... [--submit]
+#   → data/record_app.py <job_id> ... (DB row)
+
+uv run pytest tests/ -q          # full suite
+```
+
 ## Phase 2 — Job ingestion
 
 Two sources (no others, per spec):
