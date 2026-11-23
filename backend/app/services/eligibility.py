@@ -132,27 +132,57 @@ _EXP_MIN_PATTERNS = (
 )
 
 
-def required_experience_years(text: str) -> int | None:
-    """Highest minimum-years-of-experience claim found in the JD, or None.
+def find_experience_minimum(text: str) -> tuple[int | None, tuple[int, int] | None]:
+    """Highest minimum-years-of-experience claim + its match span in ``text``.
 
     Ranges ("5 to 8 years") are judged by their LOW end and their span is
     masked before the single-number patterns run, so the range's upper bound
     is never double-counted as a separate "8 years" requirement.
+
+    Company-brag phrases ("our teams bring over 30 years of experience
+    helping business leaders") are masked — they describe the employer's
+    history, not a candidate requirement (live false positive 2026-11-23:
+    Talan's "teams bring over 30 years of experience" rejected a Senior
+    Java role whose real minimum was 4-6).
     """
     best: int | None = None
+    best_span: tuple[int, int] | None = None
     masked = text
+    # "18 years of age" / "21 years old" = a legal-age statement, not
+    # experience (live false positive 2026-11-23: Bank of America's "you
+    # must be at least 18 years of age" rejected a strong Java role).
+    masked = re.sub(r"\b\d{1,2}\s*(?:years?|yrs?)\s+(?:of\s+age|old|in\s+age)\b",
+                    " ", masked, flags=re.I)
+    # employer-history brag: "...(we|our|team|company...) bring over N years
+    # of experience" / "with over N years of experience". "with" requires
+    # over/more-than so a plain requirement ("someone with 8 years of
+    # experience") is not masked.
+    masked = re.sub(
+        r"\b(?:bring|brings|brought)\s+(?:over\s+|more\s+than\s+)?"
+        r"\d{1,2}\s*(?:years?|yrs?)\s+(?:of\s+)?(?:relevant\s+)?(?:experience|exp\b)",
+        " ", masked, flags=re.I)
+    masked = re.sub(
+        r"\bwith\s+(?:over\s+|more\s+than\s+)"
+        r"\d{1,2}\s*(?:years?|yrs?)\s+(?:of\s+)?(?:relevant\s+)?(?:experience|exp\b)",
+        " ", masked, flags=re.I)
     for m in _EXP_MIN_PATTERNS[-1].finditer(text):  # the range pattern
         n = int(m.group(1))
         if 1 <= n <= 40:
             masked = masked[: m.start()] + " " * (m.end() - m.start()) + masked[m.end():]
             if best is None or n > best:
-                best = n
+                best, best_span = n, (m.start(), m.end())
     for rx in _EXP_MIN_PATTERNS[:-1]:
         for m in rx.finditer(masked):
             n = int(m.group(1))
             if 1 <= n <= 40 and (best is None or n > best):
-                best = n
-    return best
+                best, best_span = n, (m.start(), m.end())
+    return best, best_span
+
+
+def required_experience_years(text: str) -> int | None:
+    """Highest minimum-years-of-experience claim found in the JD, or None."""
+    years, _ = find_experience_minimum(text)
+    return years
 
 
 def assess_jd(jd_text: str | None) -> dict:
@@ -184,11 +214,15 @@ def assess_jd(jd_text: str | None) -> dict:
             reasons.append(f"{label}: \"{_quote(text, m)}\"")
 
     # Experience ceiling: reject roles far above the resume's level.
-    req_years = required_experience_years(text)
+    req_years, req_span = find_experience_minimum(text)
     if req_years is not None and req_years > USER_YOE + EXPERIENCE_HEADROOM:
-        idx = text.lower().find(str(req_years))
-        start = max(0, idx - 30)
-        snippet = re.sub(r"\s+", " ", text[start:start + 100]).strip()
+        if req_span:
+            start = max(0, req_span[0] - 30)
+            snippet = re.sub(r"\s+", " ", text[start:req_span[1] + 40]).strip()
+        else:
+            idx = text.lower().find(str(req_years))
+            start = max(0, idx - 30)
+            snippet = re.sub(r"\s+", " ", text[start:start + 100]).strip()
         reasons.append(
             f"experience_mismatch: JD minimum {req_years} years "
             f"(resume: {int(USER_YOE)}+ years) - \"{snippet}\"")
@@ -217,32 +251,69 @@ def assess_jd(jd_text: str | None) -> dict:
     }
 
 
-def assess_jd_skills(jd_text: str | None, resume_skills: list[str] | None) -> dict:
-    """Deterministic stack-fit check (user rule 2026-11-05: judge by the JD,
-    not the title — companies name roles differently, so a Java/Spring
-    developer may sit behind a "Data Platform Engineer" title).
+# --- Title-level gate (rejection lessons 2026-11-23) ---
+# Elastic rejected the "Principal Java Engineer" application: the resume is at
+# 4+ years (Mid/Senior level), and Principal/Staff/Manager/Director titles sit
+# above that even when the JD body states no explicit years minimum (the YOE
+# gate above never fired for them). Garmin rejected "Senior SWE - Mobile iOS":
+# the resume has ZERO native mobile experience — that is a discipline mismatch
+# (unlike a backend stack preference, which the user's 2026-11-18 rule says
+# to apply anyway and fix in the resume).
+_SENIORITY_REJECT = re.compile(
+    r"\b(principal|distinguished|fellow|director|manager|"
+    r"head\s+of|vice\s+president|\bvp\b|chief|"
+    r"staff\s+(?:senior\s+)?(?:software|full[-\s]?stack|backend|frontend|platform|sre|swe|java|python|data|ml|machine[-\s]?learning|engineer|developer))\b",
+    re.I)
+_MOBILE_REJECT = re.compile(
+    r"\b(mobile\s+(?:ios|android)|ios\s+(?:engineer|developer|software|applications?|app|"
+    r"mobile)\b|android\s+(?:engineer|developer|software|applications?|app|mobile)\b|"
+    r"ios\s*&\s*android)\b",
+    re.I)
 
-    Token-free (no LLM): counts canonical skills the JD mentions and how many
-    the resume also has. Rejects only on a clear mismatch — the JD is built
-    around 3+ canonical skills and the resume has NONE of them. Borderline
-    overlap passes: the user reviews decisions in the dashboard.
+
+def assess_title(title: str | None) -> dict:
+    """Title-level pre-screen: reject above-level seniority (Principal, Staff,
+    Manager, Director, ...) and native iOS/Android roles the resume has no
+    experience in. Rejection lessons 2026-11-23 (Elastic Principal Java Eng,
+    Garmin Mobile iOS, Affirm Manager ML Engineering).
+
+    Returns ``{"decision": "apply"|"reject", "reasons": [str, ...]}``.
     """
+    reasons: list[str] = []
+    if title:
+        t = re.sub(r"\s+", " ", title).strip()
+        if _SENIORITY_REJECT.search(t):
+            reasons.append(
+                f"seniority_mismatch: title level above resume's 4+ years - \"{t[:80]}\"")
+        if _MOBILE_REJECT.search(t):
+            reasons.append(
+                f"mobile_discipline: native iOS/Android role, resume has no mobile experience - \"{t[:80]}\"")
+    return {"decision": "reject" if reasons else "apply", "reasons": reasons}
+
+
+def assess_jd_skills(jd_text: str | None, resume_skills: list[str] | None) -> dict:
+    """Deterministic stack-fit read (user rule 2026-11-05: judge by the JD,
+    not the title — companies name roles differently).
+
+    USER RULE CHANGE 2026-11-18: stack mismatch NEVER rejects anymore —
+    apply regardless, and report which canonical skills the JD asks for that
+    the resume lacks (`missing`); the tailoring step ADDS those skills to the
+    resume instead of refusing the job.
+
+    Token-free (no LLM): returns every canonical skill the JD mentions, the
+    ones the resume already has (`hits`), and the gap (`missing`).
+    """
+    result = {"decision": "apply", "reasons": [], "mentioned": [], "hits": [], "missing": []}
     if not jd_text or not resume_skills:
-        return {"decision": "apply", "reasons": []}
+        return result
     from ..ingestion.match import SKILL_VOCAB, _resume_skill_names
 
     text = re.sub(r"\s+", " ", jd_text)
     mentioned = [label for label, rx in SKILL_VOCAB.items() if rx.search(text)]
-    if len(mentioned) < 3:
-        return {"decision": "apply", "reasons": []}
     resume = _resume_skill_names(resume_skills)
     hits = [label for label in mentioned if label in resume]
-    if not hits:
-        return {
-            "decision": "reject",
-            "reasons": [
-                "stack_mismatch: JD is built around " + ", ".join(mentioned)
-                + " — the resume has none of these"
-            ],
-        }
-    return {"decision": "apply", "reasons": []}
+    missing = [label for label in mentioned if label not in resume]
+    result.update(mentioned=mentioned, hits=hits, missing=missing)
+    if missing:
+        result["reasons"].append("jd_skills_to_add: " + ", ".join(missing))
+    return result

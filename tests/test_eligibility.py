@@ -177,13 +177,17 @@ RESUME_SKILLS = ["Java", "Spring Boot", "React", "PostgreSQL", "SQL",
                  "AWS", "REST APIs", "Microservices"]
 
 
-def test_stack_mismatch_rejects():
+def test_stack_mismatch_applies_and_reports_missing():
+    # USER RULE 2026-11-18: stack mismatch NEVER rejects — apply anyway, and
+    # report the JD skills the resume lacks so tailoring can ADD them.
     from backend.app.services.eligibility import assess_jd_skills
     r = assess_jd_skills(
         "We need GraphQL, MongoDB, Redis and Kafka experts for the event platform.",
         RESUME_SKILLS)
-    assert r["decision"] == "reject"
-    assert any("stack_mismatch" in x for x in r["reasons"])
+    assert r["decision"] == "apply"
+    assert r["missing"], "expected the resume-lacking JD skills to be reported"
+    assert not (set(r["hits"]) & set(r["missing"]))
+    assert any("jd_skills_to_add" in x for x in r["reasons"])
 
 
 def test_stack_fit_applies():
@@ -210,3 +214,154 @@ def test_unknown_stack_has_no_signal():
     r = assess_jd_skills("Looking for iOS developers with Swift and UIKit.",
                          RESUME_SKILLS)
     assert r["decision"] == "apply"
+
+
+# --- Title-level gate (rejection lessons 2026-11-23: Elastic Principal,
+#     Garmin Mobile iOS, Affirm Manager ML) ---
+
+def test_title_principal_rejects():
+    from backend.app.services.eligibility import assess_title
+    r = assess_title("Principal Java Engineer - Distributed Systems, Serverless - Elasticsearch")
+    assert r["decision"] == "reject"
+    assert any("seniority_mismatch" in x for x in r["reasons"])
+
+
+def test_title_staff_engineer_rejects():
+    from backend.app.services.eligibility import assess_title
+    r = assess_title("Staff Software Engineer, Backend")
+    assert r["decision"] == "reject"
+    assert any("seniority_mismatch" in x for x in r["reasons"])
+
+
+def test_title_manager_rejects():
+    from backend.app.services.eligibility import assess_title
+    r = assess_title("Manager, Machine Learning Engineering, Checkout")
+    assert r["decision"] == "reject"
+    assert any("seniority_mismatch" in x for x in r["reasons"])
+
+
+def test_title_director_rejects():
+    from backend.app.services.eligibility import assess_title
+    r = assess_title("Director of Engineering, Platform")
+    assert r["decision"] == "reject"
+
+
+def test_title_ios_rejects():
+    from backend.app.services.eligibility import assess_title
+    r = assess_title("Senior Software Engineer - Mobile iOS")
+    assert r["decision"] == "reject"
+    assert any("mobile_discipline" in x for x in r["reasons"])
+
+
+def test_title_android_rejects():
+    from backend.app.services.eligibility import assess_title
+    r = assess_title("Android Developer")
+    assert r["decision"] == "reject"
+    assert any("mobile_discipline" in x for x in r["reasons"])
+
+
+def test_title_senior_java_applies():
+    from backend.app.services.eligibility import assess_title
+    r = assess_title("Senior Java Backend Developer")
+    assert r["decision"] == "apply"
+    assert r["reasons"] == []
+
+
+def test_title_fullstack_applies():
+    from backend.app.services.eligibility import assess_title
+    r = assess_title("Senior Full Stack Developer, React + Spring Boot")
+    assert r["decision"] == "apply"
+    assert r["reasons"] == []
+
+
+def test_title_none_applies():
+    from backend.app.services.eligibility import assess_title
+    r = assess_title(None)
+    assert r["decision"] == "apply"
+
+
+# --- False-positive fixes (live incidents 2026-11-23) ---
+
+def test_years_of_age_is_not_experience():
+    # Bank of America: "you must be at least 18 years of age" is a legal-age
+    # statement, not a YOE requirement.
+    from backend.app.services.eligibility import required_experience_years
+    assert required_experience_years(
+        "To proceed with your application, you must be at least 18 years of age. "
+        "We seek 3+ years of Java experience.") == 3
+
+
+def test_years_of_age_alone_yields_no_requirement():
+    from backend.app.services.eligibility import required_experience_years
+    assert required_experience_years(
+        "Applicants must be at least 18 years of age. Acknowledge.") is None
+
+
+def test_fee_reassurance_does_not_flag():
+    # Optum/UnitedHealth: "we will never request you to pay a fee of any
+    # sort" is a reassurance, not a fee demand.
+    from backend.app.services.fraud import assess_job_fraud
+    r = assess_job_fraud(
+        "Full Stack Engineer - Java. "
+        "UnitedHealth Group will never request you to pay a vendor or "
+        "pay a fee of any sort to explore employment opportunities.",
+        "https://jobs.optum.com/job/memphis-tn/full-stack-engineer/1234567",
+        "https://www.optum.com")
+    assert r["decision"] != "reject", r["reasons"]
+
+
+def test_real_fee_demand_still_flags():
+    from backend.app.services.fraud import assess_job_fraud
+    r = assess_job_fraud(
+        "To apply you must pay a fee of $50. Wire transfer to our account.",
+        "https://example.com/apply", None)
+    assert r["decision"] == "reject"
+
+
+def test_company_brag_years_not_a_requirement():
+    # Talan (live 2026-11-23): "our cross-disciplinary teams bring over 30
+    # years of experience helping business leaders" describes the employer,
+    # not the candidate. Must not be read as a 30-year minimum.
+    from backend.app.services.eligibility import (
+        required_experience_years, assess_jd)
+    jd = ("Senior Java Developer. About us: our cross-disciplinary teams "
+          "bring over 30 years of experience helping business leaders "
+          "across key industries. You will have 4 years of experience "
+          "with Java and Spring Boot.")
+    assert required_experience_years(jd) == 4
+    r = assess_jd(jd)
+    assert r["decision"] == "apply", r["reasons"]
+
+
+def test_company_brag_with_over_years_masked():
+    from backend.app.services.eligibility import required_experience_years
+    jd = ("With over 25 years of experience in IT services, we deliver. "
+          "Candidates need 5+ years of backend experience.")
+    # 25 (employer history) masked; 5+ (real minimum) is what remains.
+    assert required_experience_years(jd) == 5
+
+
+def test_plain_with_years_requirement_still_counts():
+    # "someone with 8 years of experience" is a real requirement — the
+    # brag mask must not eat it (only "with OVER/more than N years" is
+    # employer-history phrasing).
+    from backend.app.services.eligibility import required_experience_years
+    jd = ("We are looking for someone with 8 years of experience in "
+          "distributed systems.")
+    assert required_experience_years(jd) == 8
+
+
+def test_experience_quote_points_at_real_phrase():
+    # Fanatics (live 2026-11-23): the quote must come from the actual
+    # "N years" requirement, not the first unrelated occurrence of the
+    # digit (the JD's "over 7,000 athletes" was being quoted for a 7-yr
+    # minimum that lives elsewhere in the text).
+    from backend.app.services.eligibility import assess_jd
+    jd = ("Serving over 7,000 athletes and celebrities. "
+          "The position requires 7+ years of hands-on Java experience "
+          "in a high-throughput environment.")
+    r = assess_jd(jd)
+    assert r["decision"] == "reject"
+    quoted = " ".join(r["reasons"])
+    assert "7+ years of hands-on" in quoted, quoted
+    assert "7,000 athletes" not in quoted, quoted
