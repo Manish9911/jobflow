@@ -11,6 +11,10 @@ It must NEVER invent experience, employers, dates, degrees, or skills. Every
 LLM output is machine-validated against the master resume; a failed validation
 triggers one retry, then falls back to a deterministic reorder-only tailoring
 so the pipeline always produces a truthful artifact.
+
+EXCEPTION (user rule 2026-11-18): skills EXPLICITLY NAMED IN THE JD that the
+resume lacks are ADDED to the skills section (never to experience, education,
+or anything else). Stack mismatch is not a rejection reason anymore.
 """
 from __future__ import annotations
 
@@ -171,8 +175,13 @@ def _skill_known(master_skills: set[str], candidate: str) -> bool:
     return False
 
 
-def validate_tailored(master: dict, tailored: dict) -> list[str]:
-    """Return a list of truth violations (empty = output is truth-preserving)."""
+def validate_tailored(master: dict, tailored: dict, jd_skills: list[str] | None = None) -> list[str]:
+    """Return a list of truth violations (empty = output is truth-preserving).
+
+    `jd_skills`: skills explicitly named in the JD — adding those to the
+    skills section is allowed (user rule 2026-11-18); adding any other skill
+    is still a violation.
+    """
     violations: list[str] = []
     for field in ("name", "email", "phone"):
         if master.get(field) and master[field] != tailored.get(field):
@@ -208,11 +217,13 @@ def validate_tailored(master: dict, tailored: dict) -> list[str]:
     for items in (master.get("skills") or {}).values():
         if isinstance(items, list):
             master_skill_flat.update(_norm(s) for s in items)
+    jd_flat = {_norm(s) for s in (jd_skills or [])}
     for items in (tailored.get("skills") or {}).values():
         if isinstance(items, list):
             for s in items:
-                if not _skill_known(master_skill_flat, s):
-                    violations.append(f"skill not in master resume: '{s}'")
+                n = _norm(s)
+                if not _skill_known(master_skill_flat, s) and not (jd_flat and n in jd_flat):
+                    violations.append(f"skill not in master resume (and not JD-named): '{s}'")
     return violations
 
 
@@ -225,12 +236,14 @@ _JD_KEYWORDS = re.compile(
 )
 
 
-def deterministic_tailor(master: dict, jd_text: str) -> tuple[dict, str]:
+def deterministic_tailor(master: dict, jd_text: str, jd_skills: list[str] | None = None) -> tuple[dict, str]:
     """Reorder-only tailoring: 100% truth-preserving without any LLM.
 
     - skill categories ordered by JD relevance, skills within them likewise
     - work-history bullets reordered by JD keyword overlap (chronology of jobs kept)
     - summary/education untouched
+    - USER RULE 2026-11-18: JD-named skills the resume lacks are ADDED to the
+      skills section (routed into the closest existing category)
     """
     jd_kw = {m.group(1).lower() for m in _JD_KEYWORDS.finditer(jd_text or "")}
 
@@ -249,7 +262,24 @@ def deterministic_tailor(master: dict, jd_text: str) -> tuple[dict, str]:
             if isinstance(items, list):
                 items = sorted(items, key=lambda s: -kw_hits(s))
             new_skills[cat] = items
-        out["skills"] = new_skills
+        skills = new_skills
+        # add JD-named skills the resume lacks (user rule 2026-11-18)
+        have = {s.lower() for items in skills.values() for s in items}
+        for sk in jd_skills or []:
+            if sk.lower() in have or any(sk.lower() in h for h in have):
+                continue
+            target = "Development Practices"
+            for cat in skills:
+                if cat.lower().startswith("development practices") or "practices" in cat.lower():
+                    target = cat
+                    break
+            if target not in skills:
+                target = next(iter(skills), "Skills")
+            if isinstance(skills[target], list):
+                skills[target].insert(0, sk)
+            else:
+                skills[target] = [sk]
+        out["skills"] = skills
 
     for job in out.get("work_history") or []:
         bullets = job.get("bullets") or []
@@ -263,11 +293,14 @@ def deterministic_tailor(master: dict, jd_text: str) -> tuple[dict, str]:
 # ---------- LLM prompts ----------
 
 TAILOR_SYSTEM = """You are a resume tailoring engine. HARD RULES (non-negotiable):
-1. You may ONLY reorder, reword, and emphasize. You must NEVER invent, add, or alter facts.
-2. Do not add, remove, or change employers, job titles, dates, locations, degrees, schools, or skills.
+1. You may ONLY reorder, reword, and emphasize. You must NEVER invent or alter facts.
+2. Do not add, remove, or change employers, job titles, dates, locations, degrees, or schools.
 3. Every bullet in your output must correspond to a fact that exists in the provided resume.
 4. Keep name, email, and phone exactly as given.
-5. Emphasize by moving the most relevant skills/experience toward the top and rewording bullets to mirror the job description's vocabulary — only when the underlying fact is unchanged.
+5. EXCEPTION for the skills section (user rule 2026-11-18): you MAY add to the
+   skills section any skill explicitly named in the job description that the
+   resume does not already list — and only those. Never add skills elsewhere.
+6. Emphasize by moving the most relevant skills/experience toward the top and rewording bullets to mirror the job description's vocabulary — only when the underlying fact is unchanged.
 Output STRICT JSON only (no markdown, no commentary) with exactly this shape:
 {"summary": string, "skills": {"<category>": [string]}, "work_history": [{"company": string, "title": string, "location": string, "start": string, "end": string, "project": string|null, "bullets": [string]}], "education": [{"degree": string, "field": string, "school": string, "start": string, "end": string}]}"""
 
@@ -333,6 +366,17 @@ def tailor_job(
     notes: dict = {"method": "llm" if llm.is_available() else "deterministic"}
     jd_used = jd[:8000]
 
+    # JD-named skills: additions to the skills section are allowed for these
+    # (user rule 2026-11-18 — apply + add the JD-asked skills, never reject on
+    # stack mismatch).
+    from ..ingestion.match import SKILL_VOCAB
+    jd_skills = [label for label, rx in SKILL_VOCAB.items() if rx.search(jd_used)]
+    have = {s.lower() for items in (master_structure.get("skills") or {}).values()
+            for s in items if isinstance(items, list) and isinstance(s, str)}
+    jd_missing = [s for s in jd_skills if not any(s.lower() in h for h in have)]
+    if jd_missing:
+        notes["jd_skills_added"] = jd_missing
+
     tailored: dict | None = None
     violations: list[str] = []
 
@@ -356,7 +400,7 @@ def tailor_job(
             try:
                 raw = llm.complete(TAILOR_SYSTEM, prompt)
                 candidate = _extract_json(raw)
-                violations = validate_tailored(master_structure, candidate)
+                violations = validate_tailored(master_structure, candidate, jd_skills)
                 if not violations:
                     tailored = candidate
                     notes["llm_attempts"] = attempt
@@ -365,7 +409,7 @@ def tailor_job(
             except Exception as exc:
                 notes[f"tailor_error_attempt_{attempt}"] = repr(exc)[:200]
         if tailored is None:
-            fallback, note = deterministic_tailor(master_structure, jd_used)
+            fallback, note = deterministic_tailor(master_structure, jd_used, jd_missing)
             tailored = fallback
             notes["method"] = "deterministic-fallback"
             notes["fallback_reason"] = note + (f" (violations: {violations})" if violations else "")
@@ -383,10 +427,10 @@ def tailor_job(
             notes["score_after_error"] = repr(exc)[:200]
     else:
         # No LLM configured: deterministic reorder + deterministic scoring.
-        tailored, note = deterministic_tailor(master_structure, jd_used)
+        tailored, note = deterministic_tailor(master_structure, jd_used, jd_missing)
         notes["method"] = "deterministic"
         notes["note"] = note
-        notes["llm"] = "not configured — set OPENAI_API_KEY in .env for LLM tailoring"
+        notes["llm"] = "not configured — set OPENAI_API_KEY (or OPENROUTER_API_KEY with LLM_PROVIDER=openrouter) in .env for LLM tailoring"
         # deterministic scores: fraction of JD-mentioned skills the resume covers
         from ..ingestion.match import SKILL_VOCAB
 

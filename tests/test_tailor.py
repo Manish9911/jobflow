@@ -129,6 +129,140 @@ def test_openai_provider_parses_response(monkeypatch):
     assert captured["body"]["messages"][0]["content"] == "sys"
 
 
+# ---------- OpenRouter provider ----------
+
+def test_openrouter_provider_unavailable_without_key():
+    from backend.app.llm import OpenRouterProvider
+    p = OpenRouterProvider("", "openai/gpt-4o-mini")
+    assert p.is_available() is False
+    with pytest.raises(LLMUnavailable, match="OPENROUTER_API_KEY"):
+        p.complete("s", "u")
+
+
+def test_openrouter_provider_posts_to_openrouter(monkeypatch):
+    from backend.app.llm import OpenRouterProvider
+    p = OpenRouterProvider("sk-or-test", "openai/gpt-4o-mini")
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["body"] = json
+
+        class R:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"choices": [{"message": {"content": "from openrouter"}}]}
+
+        return R()
+
+    import backend.app.llm as llm_pkg
+    monkeypatch.setattr(llm_pkg.httpx, "post", fake_post)
+    assert p.complete("sys", "user") == "from openrouter"
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer sk-or-test"
+    assert captured["headers"]["X-Title"] == "Jobflow"
+    assert captured["body"]["model"] == "openai/gpt-4o-mini"
+
+
+def _resp(status, content=None, model=None):
+    class R:
+        def __init__(self):
+            self.status_code = status
+            self.request = None
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+        def json(self):
+            return {"choices": [{"message": {"content": content}}]}
+    return R()
+
+
+def test_openrouter_pool_round_robin(monkeypatch):
+    from backend.app.llm import OpenRouterProvider
+    p = OpenRouterProvider("k", "a/x", models=["a/x", "b/y"])
+    seen = []
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen.append(json["model"])
+        return _resp(200, "ok")
+    import backend.app.llm as llm_pkg
+    monkeypatch.setattr(llm_pkg.httpx, "post", fake_post)
+    p.complete("s", "u"); p.complete("s", "u"); p.complete("s", "u"); p.complete("s", "u")
+    # alternates across the pool
+    assert seen[:2] == ["a/x", "b/y"] and seen[2] == "a/x"
+
+
+def test_openrouter_pool_429_benches_and_fails_over(monkeypatch):
+    import time as _t
+    from backend.app.llm import OpenRouterProvider
+    p = OpenRouterProvider("k", "a/x", models=["a/x", "b/y"])
+    calls = []
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(json["model"])
+        return _resp(429) if json["model"] == "a/x" else _resp(200, "ok")
+    import backend.app.llm as llm_pkg
+    monkeypatch.setattr(llm_pkg.httpx, "post", fake_post)
+    # first call: a/x 429s -> benched, b/y serves
+    assert p.complete("s", "u") == "ok"
+    assert calls == ["a/x", "b/y"]
+    # next call: a/x still benched -> b/y directly (no a/x hit)
+    before = len(calls)
+    assert p.complete("s", "u") == "ok"
+    assert calls[before:] == ["b/y"]
+
+
+def test_openrouter_pool_all_exhausted_raises(monkeypatch):
+    from backend.app.llm import OpenRouterProvider, LLMUnavailable
+    p = OpenRouterProvider("k", "a/x", models=["a/x", "b/y"])
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return _resp(429)
+    import backend.app.llm as llm_pkg
+    monkeypatch.setattr(llm_pkg.httpx, "post", fake_post)
+    with pytest.raises(LLMUnavailable, match="all OpenRouter free models"):
+        p.complete("s", "u")
+
+
+def test_openrouter_pool_null_content_failover(monkeypatch):
+    from backend.app.llm import OpenRouterProvider
+    p = OpenRouterProvider("k", "a/x", models=["a/x", "b/y"])
+    calls = []
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(json["model"])
+        return _resp(200, None) if json["model"] == "a/x" else _resp(200, "ok")
+    import backend.app.llm as llm_pkg
+    monkeypatch.setattr(llm_pkg.httpx, "post", fake_post)
+    # a/x returns null content (reasoning-only) -> bench + fail over to b/y
+    assert p.complete("s", "u") == "ok"
+    assert calls == ["a/x", "b/y"]
+
+
+def test_get_llm_openrouter_defaults(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    from backend.app.config import Settings
+    from backend.app.llm import OpenRouterProvider, get_llm
+    s = Settings(llm_provider="openrouter", openrouter_api_key="sk-or-test")
+    llm = get_llm(s)
+    assert isinstance(llm, OpenRouterProvider)
+    assert llm.is_available() is True
+    # plain model name gets the openai namespace for OpenRouter
+    assert llm.model == "openai/gpt-4o-mini"
+
+
+def test_get_llm_openrouter_keeps_namespaced_model(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    from backend.app.config import Settings
+    from backend.app.llm import OpenRouterProvider, get_llm
+    s = Settings(llm_provider="openrouter", openrouter_api_key="k",
+                 llm_model="anthropic/claude-3.5-sonnet")
+    llm = get_llm(s)
+    assert isinstance(llm, OpenRouterProvider)
+    assert llm.model == "anthropic/claude-3.5-sonnet"
+
+
 # ---------- truth validation ----------
 
 def test_validate_accepts_truthful_reorder():

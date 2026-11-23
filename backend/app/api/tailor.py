@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from ..config import Settings
 from ..db.deps import get_db
 from ..db.models import Job, Resume
+from ..llm import get_llm
 from ..services import tailor
 from ..services.export import export_docx, export_pdf
 
@@ -41,7 +42,7 @@ def tailored_view(db: Session, job: Job) -> dict:
     """Full tailoring result for a job (shared by the API endpoint and the page)."""
     if not job.tailored_resume_id:
         settings = Settings()
-        llm_available = bool(settings.openai_api_key)
+        llm_available = get_llm(settings).is_available()
         return {
             "status": "not_tailored",
             "llm_available": llm_available,
