@@ -4,7 +4,11 @@
 *.key
 
 # --- Personal data: resumes, DB, screenshots, cookies, uploads ---
-data/
+# data/ is the runtime dir (DB, credentials, resumes, exports) — ignore its
+# contents, but track the pipeline scripts (data/*.py) so the project runs
+# from any machine. Credential/DB/output files in data/ stay ignored.
+data/*
+!data/*.py
 *.db
 *.sqlite3
 resumes/
@@ -32,3 +36,8 @@ Thumbs.db
 # --- Logs (action logs are stored in DB, not files) ---
 *.log
 logs/
+
+# third-party repos (cloned, not tracked)
+third_party/
+graphify-out/
+chrome_hwnd.txt

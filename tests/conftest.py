@@ -1,3 +1,9 @@
+import os
+
+# Keep tests hermetic: never load the real project .env (it contains the
+# live OpenRouter key + model and would leak into Settings under test).
+os.environ["JOBFLOW_ENV_FILE"] = os.devnull
+
 import pytest
 from fastapi.testclient import TestClient
 

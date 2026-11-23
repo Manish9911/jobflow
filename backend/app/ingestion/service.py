@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from datetime import datetime, timezone
 
@@ -12,6 +13,12 @@ from sqlalchemy.orm import Session
 from ..db.models import Company, Job, Skill
 from .ats import detect_company_ats, registrable_domain
 from .ats_jobs import fetch_jobs_for_endpoint
+from .abstractvc import (
+    fetch_all_jobs,
+    make_client as make_abstractvc_client,
+    parse_abstractvc_response,
+    bootstrap_token,
+)
 from .filters import job_passes_filters
 from .hiring_cafe import (
     DEFAULT_PAGES,
@@ -42,6 +49,27 @@ def job_unique_key(job: dict) -> str:
     return hashlib.sha1(f"{job.get('source', '')}|{core}".encode("utf-8")).hexdigest()
 
 
+def _slug(text: str | None) -> str:
+    """Lowercase, alnum-only — 'Senior Java Developer (Remote)' -> 'seniorjavadeveloperremote'."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def job_norm_key(job: dict) -> str:
+    """Source-agnostic dedupe key: company + title + location, normalized.
+
+    Catches the same posting re-surfacing under a different URL or from a
+    different board (hiring.cafe vs the company's own ATS feed). Returns ''
+    when company or title is missing — an empty key must never match anything.
+    """
+    company = _slug(job.get("company"))
+    title = _slug(job.get("title"))
+    if not company or not title:
+        return ""
+    return hashlib.sha1(
+        f"{company}|{title}|{_slug(job.get('location'))}".encode("utf-8")
+    ).hexdigest()
+
+
 def upsert_companies(db: Session, raw_companies: list[dict]) -> dict:
     added = updated = 0
     for rc in raw_companies:
@@ -64,11 +92,20 @@ def upsert_companies(db: Session, raw_companies: list[dict]) -> dict:
 def store_jobs(db: Session, jobs: list[dict]) -> dict:
     added = skipped = passing = 0
     resume_skills = load_resume_skills(db)
+    seen_norm_keys: set[str] = set()
     for j in jobs:
         key = job_unique_key(j)
+        nkey = job_norm_key(j)
         if db.query(Job).filter(Job.unique_key == key).first() is not None:
             skipped += 1
             continue
+        if nkey:
+            if nkey in seen_norm_keys or (
+                db.query(Job).filter(Job.norm_key == nkey).first() is not None
+            ):
+                skipped += 1
+                continue
+            seen_norm_keys.add(nkey)
         keep, reasons = job_passes_filters(j)
         row = Job(
             title=j.get("title") or "",
@@ -85,6 +122,7 @@ def store_jobs(db: Session, jobs: list[dict]) -> dict:
             salary_currency=j.get("salary_currency") or "USD",
             apply_url=j.get("apply_url") or "",
             source=j.get("source") or "",
+            norm_key=nkey,
             hiringcafe_id=j.get("hiringcafe_id") or "",
             indexed_at=j.get("indexed_at"),
             passes_filters=keep,
@@ -158,6 +196,32 @@ def ingest_hiring_cafe(db: Session, pages: list[str] | None = None) -> dict:
 def ingest_hiring_cafe_manual(db: Session, html: str) -> dict:
     jobs = parse_hiring_cafe_html(html)
     return {"pages": 1, "errors": [], "stored": store_jobs(db, jobs)}
+
+
+def ingest_abstractvc(db: Session, query: dict | None = None) -> dict:
+    """Pull the SWE jobs from jobs.abstractvc.com (Abstract Ventures board)."""
+    results: dict = {"errors": [], "pages": 0, "seen": 0}
+    all_jobs: list[dict] = []
+    with make_abstractvc_client() as client:
+        try:
+            token = bootstrap_token(client)
+        except IngestionBlocked as exc:
+            results["errors"].append(f"bootstrap: BLOCKED — {exc}")
+            return results
+        try:
+            raw = fetch_all_jobs(client, token, query=query)
+        except IngestionBlocked as exc:
+            results["errors"].append(f"search: BLOCKED — {exc}")
+            results["stored"] = store_jobs(db, all_jobs)
+            return results
+        except httpx.HTTPError as exc:
+            results["errors"].append(f"search: {exc.__class__.__name__}: {str(exc)[:120]}")
+            results["stored"] = store_jobs(db, all_jobs)
+            return results
+        all_jobs = parse_abstractvc_response({"jobs": raw})
+        results["seen"] = len(all_jobs)
+    results["stored"] = store_jobs(db, all_jobs)
+    return results
 
 
 def refilter_jobs(db: Session) -> dict:

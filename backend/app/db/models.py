@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
@@ -26,6 +26,18 @@ class Profile(Base):
     target_roles: Mapped[str | None] = mapped_column(Text, nullable=True)
     locations_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list
     min_salary: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Profile links (user rule 2026-11-03: Overview form fields, auto-filled into ATS forms)
+    linkedin: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    portfolio: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Permission model (2026-11-09, from the job-apply-agent safety model):
+    # 'autonomous' = the agent submits applications on its own (24/7 mode);
+    # 'approve_each' = the agent fills the form and STOPS — the user approves
+    # or rejects each application from the Applications page before anything
+    # is submitted. Outreach (cold email) permission is deliberately SEPARATE
+    # from application permission — a login or an apply grant never implies
+    # sending email.
+    submission_mode: Mapped[str] = mapped_column(String(20), default="autonomous")
+    outreach_permitted: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -116,6 +128,57 @@ class CommonAnswer(Base):
     profile: Mapped["Profile"] = relationship(back_populates="common_answers")
 
 
+class Application(Base):
+    """One application attempt (dry-run or not) for a job, using one resume version."""
+    __tablename__ = "applications"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), index=True)
+    resume_id: Mapped[int] = mapped_column(ForeignKey("resumes.id"))
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    # pending | dry_run_completed | captcha_manual | manual_required | failed
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=True)
+    screenshot_path: Mapped[str | None] = mapped_column(String(512))
+    error_text: Mapped[str | None] = mapped_column(Text)
+    notes_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    job: Mapped["Job"] = relationship(back_populates="applications")
+    resume: Mapped["Resume"] = relationship()
+    action_log: Mapped[list["ActionLog"]] = relationship(back_populates="application")
+
+
+class Notification(Base):
+    """User-facing alert from the agent (CAPTCHA walls, failures, successes)."""
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # action = needs the user now | info = FYI
+    kind: Mapped[str] = mapped_column(String(20), default="info")
+    title: Mapped[str] = mapped_column(String(300))
+    detail: Mapped[str] = mapped_column(Text, default="")
+    # external URL (e.g. the employer form) or in-app path
+    link: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class ActionLog(Base):
+    """Per-field audit trail for one application attempt (the 'log every action' hard rule)."""
+    __tablename__ = "action_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    application_id: Mapped[int] = mapped_column(ForeignKey("applications.id"), index=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), index=True)
+    action: Mapped[str] = mapped_column(String(60))
+    field: Mapped[str | None] = mapped_column(String(200))
+    detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    application: Mapped["Application"] = relationship(back_populates="action_log")
+
+
 class Company(Base):
     __tablename__ = "companies"
 
@@ -154,6 +217,10 @@ class Job(Base):
     salary_currency: Mapped[str] = mapped_column(String(10), default="USD")
     apply_url: Mapped[str] = mapped_column(String(1000), default="")
     source: Mapped[str] = mapped_column(String(60), default="")  # hiringcafe|greenhouse|lever|...
+    # Source-agnostic dedupe key: sha1(slug(company)|slug(title)|slug(state)).
+    # Catches the same posting re-surfacing from a different board/URL (e.g.
+    # hiring.cafe + the company's own ATS feed). Empty when title/company missing.
+    norm_key: Mapped[str] = mapped_column(String(120), default="", index=True)
     hiringcafe_id: Mapped[str] = mapped_column(String(120), default="")
     indexed_at: Mapped[str | None] = mapped_column(String(60), nullable=True)
     # Filtering result at ingest time (informational; re-evaluable anytime)
@@ -168,6 +235,42 @@ class Job(Base):
     tailored_resume_id: Mapped[int | None] = mapped_column(nullable=True)
     tailor_notes_json: Mapped[str] = mapped_column(Text, default="{}")
     cover_letter_text: Mapped[str] = mapped_column(Text, default="")
+    # Phase 5: JD eligibility gate result ({"decision": "apply"|"reject", ...})
+    jd_eligibility_json: Mapped[str] = mapped_column(Text, default="{}")
+    # Permission model (2026-11-09): fraud-screen verdict stored with the job
+    # ({"decision": "apply"|"review"|"reject", "reasons": [...]})
+    fraud_screen_json: Mapped[str] = mapped_column(Text, default="{}")
     # Deduplication key: sha1(source|apply_url|company+title)
     unique_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    applications: Mapped[list["Application"]] = relationship(back_populates="job")
+
+
+class Lesson(Base):
+    """Self-improvement memory (habit inherited from the job-apply-agent
+    skill, 2026-11-09): the agent learns from every outcome and the user's
+    confirmations, and re-reads these lessons before acting — so a walled
+    board gets skipped instead of re-battled, a domain the user confirmed as
+    legit never gets re-flagged, and user tips survive restarts.
+
+    ``scope`` decides applicability: ``global`` (always), ``company:<name>``
+    (that company, case-insensitive), ``domain:<host>`` (forms/postings on
+    that registrable domain), ``ats:<adapter>`` (that ATS adapter).
+    ``kind``: ``wall`` (CAPTCHA-walled board — skip), ``fraud_ok`` (user
+    confirmed legit), ``fraud_bad`` (scam — hard reject), ``tip`` (user
+    guidance), ``pref`` (standing preference).
+    """
+    __tablename__ = "lessons"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope: Mapped[str] = mapped_column(String(200), index=True)
+    kind: Mapped[str] = mapped_column(String(20), default="tip")
+    text: Mapped[str] = mapped_column(Text, default="")
+    # Wall strikes accumulate on the same domain until they form a `wall`
+    # lesson (or a success clears them).
+    count: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )

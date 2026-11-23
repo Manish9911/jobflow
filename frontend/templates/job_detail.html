@@ -55,9 +55,8 @@
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0">
     <a href="{{ tailored.exports.docx }}" style="display:inline-block;background:var(--accent);color:#fff;padding:8px 16px;border-radius:8px;text-decoration:none">Download tailored DOCX</a>
     <a href="{{ tailored.exports.pdf }}" style="display:inline-block;background:var(--accent);color:#fff;padding:8px 16px;border-radius:8px;text-decoration:none">Download tailored PDF</a>
-    <button class="secondary" hx-post="/api/jobs/{{ job.id }}/tailor" hx-swap="none"
-            hx-vals='{"jd_text": null, "cover_letter": false}'
-            hx-on::after-request="if(event.detail.successfullySwapped) location.reload()">Re-tailor</button>
+    <button class="secondary" data-json="/api/jobs/{{ job.id }}/tailor"
+            data-json-body='{"jd_text": null, "cover_letter": false}'>Re-tailor</button>
   </div>
   {% if tailored.cover_letter %}
   <details>
@@ -84,9 +83,7 @@
     for LLM tailoring; without it, a deterministic reorder-only mode is used (scores = JD skill coverage).
     {% endif %}
   </p>
-  <form hx-post="/api/jobs/{{ job.id }}/tailor" hx-swap="none"
-        hx-on::after-request="if(event.detail.successfullySwapped) location.reload()"
-        hx-disabled-elt="button[type=submit]" style="margin-top:10px">
+  <form data-json="/api/jobs/{{ job.id }}/tailor" style="margin-top:10px">
     <textarea name="jd_text" rows="5" style="width:100%"
               placeholder="Optional: paste the full job description here. Leave empty to fetch it from the job page automatically."></textarea>
     <p>
@@ -95,6 +92,38 @@
     </p>
     <p class="muted">Takes ~15-60 seconds with the LLM. You get before/after scores, a diff, and DOCX/PDF downloads.</p>
   </form>
+  {% endif %}
+</div>
+<div class="card">
+  <h2>Apply — dry-run (Phase 4)</h2>
+  <p class="muted">
+    Fills the employer's application form with your profile + tailored resume, uploads the
+    resume file, ticks GDPR/H-1B consents, screenshots the result, and logs every field.
+    <strong>It never submits — you review and click Apply yourself.</strong>
+    CAPTCHAs are detected and handed back to you (never solved).
+    Uses the tailored resume for this job if available, else your master resume.
+  </p>
+  {% if job.apply_url %}
+  <form data-json="/api/jobs/{{ job.id }}/apply" style="margin-top:10px">
+    <input type="hidden" name="dry_run" value="true">
+    <p>
+      <button type="submit" id="apply-dryrun">Run dry-run application (10–60s)</button>
+      <span id="apply-status" class="muted"></span>
+    </p>
+  </form>
+  <script>
+    (function () {
+      var btn = document.getElementById('apply-dryrun');
+      if (!btn) return;
+      btn.addEventListener('click', function () {
+        var st = document.getElementById('apply-status');
+        st.textContent = ' Running… opening the employer form, filling fields, screenshotting. Do not close this tab.';
+      });
+    })();
+  </script>
+  <p class="muted">Takes 10–60s: headless browser opens the employer form — the result appears on the <a href="/applications" style="color:var(--accent)">Applications</a> page.</p>
+  {% else %}
+  <p class="muted">No direct application URL captured for this listing — use the "Open original application page" link above and apply manually.</p>
   {% endif %}
 </div>
 <p><a href="/jobs" style="color:var(--accent)">← back to all jobs</a></p>

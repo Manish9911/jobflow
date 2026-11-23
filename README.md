@@ -2,7 +2,7 @@
 
 Local, human-in-the-loop automated job-application pipeline.
 
-> **Status: Phase 3 complete (LLM tailoring engine) — on branch `phase-3-tailoring`, pending approval.**
+> **Status: Phase 4 complete (ATS application automation, dry-run) — on branch `phase-4-automation`, pending approval.**
 
 ## What it will do
 
@@ -121,6 +121,32 @@ Open http://127.0.0.1:8000/ — the dashboard.
 uv run python scripts/seed_profile.py path/to/resume.docx
 ```
 
+## Run on any machine (full pipeline)
+
+Everything the pipeline needs is in this repo — app code plus every `data/*.py` script (resume builder, ATS drivers, drill apply/record, quota watchdog, graphify wrapper). The gitignored runtime state is intentionally local-only and must exist on each machine:
+
+1. `uv venv && uv sync`
+2. `cp .env.example .env` — set `OPENROUTER_API_KEY` (free-tier key) + `LLM_MODEL` / `LLM_MODELS` (dual free-model pool).
+3. Master resume DOCX on the machine; the builder scripts (`data/build_content.py`, `data/build_resume.py`) hold its default path constant — adjust if it lives elsewhere.
+4. `data/jobflow.db` is NOT committed — a fresh clone starts with an empty DB. Credential files (`data/portal_credentials.json`, `data/credentials_workday.txt`, `data/gmail_app_password.txt`) are local-only by design and are never committed.
+5. ATS automation drives a REAL visible Chrome over CDP port 9334 (`chrome.exe --remote-debugging-port=9334 --profile-directory=Default`) — the real profile is what passes reCAPTCHA walls; never headless for submissions.
+6. Optional — Graphify knowledge graph: clone `github.com/Graphify-Labs/graphify` into `third_party/graphify`, then `uv tool install --force "graphifyy[openai,mcp,leiden,pdf,office,watch,sql] @ file:///<repo>/third_party/graphify"` and build with `data/run_graphify.py` (free OpenRouter backend). Outputs in `graphify-out/` (gitignored); query with `graphify query "<question>"`.
+7. Optional — Gmail verification codes: himalaya CLI + app password file (never committed).
+
+Core commands:
+
+```bash
+# app (start from the REPO ROOT — DB path is CWD-relative)
+uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+
+# per-job pipeline
+#   JD fetch + pre-screen (eligibility.py) → data/build_content.py --keywords "..."
+#   → data/build_resume.py --content ... --out dir → data/ats_apply.py --url ... --resume ... [--submit]
+#   → data/record_app.py <job_id> ... (DB row)
+
+uv run pytest tests/ -q          # full suite
+```
+
 ## Phase 2 — Job ingestion
 
 Two sources (no others, per spec):
@@ -152,5 +178,22 @@ Job detail page → **Resume tailoring** card:
 **Without an API key** the engine runs in deterministic mode: JD-keyword reordering (100% truth-preserving) and skill-coverage scoring. Add `OPENAI_API_KEY` to `.env` for semantic LLM scoring + rewording + cover letters.
 
 Verified 2026-11-02 (live): real Adyen "Software Engineer II (Java)" job — JD auto-fetched from Greenhouse API, tailored resume generated, before/after 100/100 (deterministic mode), 2-page PDF + 38KB DOCX exports visually verified; hallucination-fallback path covered by unit tests.
+
+## Phase 4 — ATS application automation (dry-run)
+
+Job detail page → **Apply — dry-run** card. One click drives a headless Chromium (Playwright) through the employer's application form:
+
+1. **ATS detection** — Greenhouse, Lever, Ashby, Workday adapters (URL signature + ingest-source hint); anything unmatched is queued as `manual_required`.
+2. **Field fill** — profile/resume literals only (no generated text): first/last name, email, phone, location, LinkedIn/portfolio, resume **file upload**, GDPR/data-protection consent (EU) and H-1B sponsorship selection (US). Unrecognized free-text fields are deliberately left blank and logged — never guessed.
+3. **Hard rules enforced in code**:
+   - **DRY-RUN is the default and nothing is ever submitted automatically** — the run stops after fill + screenshot, status `dry_run_completed`; you review and click Apply yourself.
+   - **CAPTCHAs are never solved** — reCAPTCHA/hCaptcha/Cloudflare Turnstile/challenges are detected and the run is aborted as `captcha_manual` with a screenshot.
+   - **Every field touched is written to an audit trail** (`action_log`), viewable per attempt.
+   - No passwords are stored; only public profile data is used.
+4. **Applications tracker** (`/applications`) — every attempt: status badge, resume used, action count, timestamp, screenshot.
+
+Statuses: `dry_run_completed` · `ready_for_submission` (dry_run=false still stops before submit) · `captcha_manual` · `manual_required` · `failed`.
+
+Verified 2026-11-02: 106 tests pass, including 6 **real-Chromium E2E runs** against a local mock ATS (Greenhouse-style + Lever-style forms: typed values verified server-side, file upload verified, GDPR consent + H-1B radio verified, CAPTCHA abort, unknown-ATS fallback, API + tracker page).
 
 Verified on 2026-11-02: 766 companies parsed (244 US / 275 EU), 25 companies ATS-checked (3 Greenhouse, 1 Ashby, 0 errors), 245 jobs ingested from 3 Greenhouse feeds, 15 passing filters (avg match 50/100, top: "Software Engineer II (Java)" at 95).

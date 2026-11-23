@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from ..config import Settings
 from ..db.deps import get_db
 from ..db.models import Job, Resume
+from ..llm import get_llm
 from ..services import tailor
 from ..services.export import export_docx, export_pdf
 
@@ -41,7 +42,7 @@ def tailored_view(db: Session, job: Job) -> dict:
     """Full tailoring result for a job (shared by the API endpoint and the page)."""
     if not job.tailored_resume_id:
         settings = Settings()
-        llm_available = bool(settings.openai_api_key)
+        llm_available = get_llm(settings).is_available()
         return {
             "status": "not_tailored",
             "llm_available": llm_available,
@@ -105,9 +106,13 @@ def export_resume(
         raise HTTPException(404, "Resume has no parsed content")
 
     out_dir = request.app.state.data_dir / "exports"
-    safe_name = "".join(c for c in f"{job.company}-{job.title[:40]}" if c.isalnum() or c in "-_ ")
-    safe_name = safe_name.replace(" ", "_")[:60] or "job"
-    filename = f"resume_{kind}_{safe_name}.{fmt}"
+    # Naming (user rule 2026-11-06): "<user> <company> <role>.<fmt>" —
+    # no resume_<kind> prefixes, no underscores or other symbols.
+    from ..services.export import humanized_filename
+
+    filename = humanized_filename(
+        structure.get("name"), job.company, job.title, ext=fmt
+    )
     path = out_dir / filename
 
     if fmt == "docx":
